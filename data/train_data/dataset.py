@@ -1,6 +1,5 @@
 import concurrent.futures
 import os
-import traceback
 from bisect import bisect_right
 import numpy as np
 from scipy.io import loadmat
@@ -9,15 +8,17 @@ from torch.utils.data import Dataset
 
 class CamelsDataset(Dataset):
     def __init__(self, root_path: str, basin_list: list, past_len: int, pred_len: int,
-                 withBaseflow=True, withSignatures=True, device='cuda:0', num_worker=4,
+                 withBaseflow, withSignatures, streamflow_index, signatures_index, device='cuda:0', num_worker=4,
                  stage='train', x_mean=None, y_mean=None, x_std=None, y_std=None, y_stds_dict=None):
         # 设置数据
         self.root_path = root_path
-        self.basin_list = basin_list
+        self.basin_list = np.array(basin_list)
         self.past_len = past_len
         self.pred_len = pred_len
         self.withBaseflow = withBaseflow
         self.withSignatures = withSignatures
+        self.streamflow_index = streamflow_index
+        self.signatures_index = signatures_index
         self.device = device
         self.num_worker = num_worker
         # 初始化
@@ -125,7 +126,7 @@ class CamelsDataset(Dataset):
 
     def _normalize_data(self):
         # Normalize data
-        for idx, basin in enumerate(self.basin_list):
+        for idx, basin in enumerate(self.basin_list.tolist()):
             # print(f"[{basin}]: normalizing data %.4f" % (idx / len(self.basin_list)))
             x_norm = self.normalization(self.x_dict[basin], self.x_mean, self.x_std)
             y_norm = self.normalization(self.y_dict[basin], self.y_mean, self.y_std)
@@ -154,7 +155,7 @@ class CamelsDataset(Dataset):
         output_data = None
         for idx, basin in enumerate(basins):
             try:
-                print(f"[{thread_num}-{basin}]: loading data %.4f" % (idx / basin_number), flush=True)
+                # print(f"[{thread_num}-{basin}]: loading data %.4f" % (idx / basin_number), flush=True)
                 camels_name = basin.split('_')[0]
                 dirpath = os.path.join(cls.root_path, camels_name)
                 if os.path.exists(os.path.join(dirpath, cls.stage)):
@@ -164,7 +165,7 @@ class CamelsDataset(Dataset):
                 # 处理nan数据
                 data = cls.drop_nan_data(basin, data, cls.withBaseflow, cls.withSignatures)
                 if data is None:  # static data contains nan value
-                    cls.basin_list.remove(basin)
+                    cls.basin_list = np.delete(cls.basin_list, np.where(cls.basin_list == basin))
                     continue
                 # 处理x_dict数据
                 forcing_static = np.array(data['forcing_static']).flatten()
@@ -172,14 +173,10 @@ class CamelsDataset(Dataset):
                 forcing_timeseries = cls.concat_timeseries_static(forcing_timeseries, forcing_static)
                 # 处理y_dict数据
                 streamflow_timeseries = np.array(data['streamflow_timeseries'])
+                streamflow_timeseries = streamflow_timeseries[:, :, cls.streamflow_index]
                 streamflow_static = np.array(data['streamflow_static']).flatten()
-                # 如果不包含每日基流，那么只保留streamflow_timeseries的第一行
-                if not cls.withBaseflow:
-                    shape = streamflow_timeseries.shape
-                    streamflow_timeseries = streamflow_timeseries[:, :, 0].reshape((shape[0], shape[1], 1))
-                # 如果包含流量指数，那么就拼接到streamflow_timeseries中
-                if cls.withSignatures:
-                    streamflow_timeseries = cls.concat_timeseries_static(streamflow_timeseries, streamflow_static)
+                streamflow_static = streamflow_static[cls.signatures_index]
+                streamflow_timeseries = cls.concat_timeseries_static(streamflow_timeseries, streamflow_static)
                 # 保存样本数据，分basin
                 cls.x_dict[basin] = forcing_timeseries.astype(np.float32)
                 cls.y_dict[basin] = streamflow_timeseries.astype(np.float32)
@@ -198,13 +195,13 @@ class CamelsDataset(Dataset):
                         input_data = np.concatenate([input_data, forcing_timeseries], axis=0)
                         output_data = np.concatenate([output_data, streamflow_timeseries], axis=0)
             except Exception:
-                print(f"[{basin}] contains error!")
+                # print(f"[{basin}] contains error!")
                 cls.x_dict.pop(basin, 0)
                 cls.y_dict.pop(basin, 0)
                 cls.length_dict.pop(basin, 0)
                 cls.y_stds_dict.pop(basin, 0)
-                cls.basin_list.remove(basin)
-                traceback.print_exc()
+                cls.basin_list = np.delete(cls.basin_list, np.where(cls.basin_list == basin))
+                # traceback.print_exc()
                 continue
         if not use_chunk_mean:  # False为不使用chunk mean，直接返回全部data
             return input_data, output_data
@@ -220,7 +217,7 @@ class CamelsDataset(Dataset):
         forcing_static = data['forcing_static']
         if ((with_signatures and np.isnan(streamflow_static).any())
                 or np.isnan(forcing_static).any()):
-            print(f"[{basin}] static data contains nan value!")
+            # print(f"[{basin}] static data contains nan value!")
             return None
         streamflow_timeseries = data['streamflow_timeseries']
         forcing_timeseries = data['forcing_timeseries']
@@ -230,7 +227,7 @@ class CamelsDataset(Dataset):
                     or (with_baseflow and np.isnan(streamflow_timeseries[index, :, 1:]).any())
                     or np.isnan(forcing_timeseries[index, :, :]).any()):
                 indexs.append(index)
-                print(f"[{basin}-{index}] timeseries data contains nan value!")
+                # print(f"[{basin}-{index}] timeseries data contains nan value!")
         if len(indexs) > 0:
             data['streamflow_timeseries'] = np.delete(streamflow_timeseries, indexs, axis=0)
             data['forcing_timeseries'] = np.delete(forcing_timeseries, indexs, axis=0)

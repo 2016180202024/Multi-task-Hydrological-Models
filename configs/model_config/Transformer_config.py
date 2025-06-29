@@ -13,20 +13,13 @@ class TransformerConfig:
     assert n_encoder_layers == n_decoder_layers  # we assert they are equal here
     d_ff = 256  # feedforward dimension
     dropout_rate = 0.1  # dropout rate
-    src_len = DataShapeConfig.src_len
-    tgt_len = DataShapeConfig.tgt_len
-    pred_len = DataShapeConfig.pred_len
-    src_size = DataShapeConfig.src_size
-    tgt_size = DataShapeConfig.tgt_size
 
-    def __init__(self, src_len=DataShapeConfig.src_len, src_size=DataShapeConfig.src_size,
-                 past_len=DataShapeConfig.past_len, pred_len=DataShapeConfig.pred_len,
-                 tgt_size=DataShapeConfig.tgt_size):
-        self.src_len = src_len
-        self.tgt_len = past_len + pred_len
-        self.pred_len = pred_len
-        self.src_size = src_size
-        self.tgt_size = tgt_size
+    def __init__(self, datashape_config: DataShapeConfig):
+        self.src_len = datashape_config.src_len
+        self.tgt_len = datashape_config.past_len + datashape_config.pred_len
+        self.pred_len = datashape_config.pred_len
+        self.src_size = datashape_config.src_size
+        self.tgt_size = datashape_config.tgt_size
 
     model_info = (f"{model_name}_{decode_mode}_"
                   f"[{d_model}-{n_heads}-{n_encoder_layers}-{d_ff}-{dropout_rate}]")

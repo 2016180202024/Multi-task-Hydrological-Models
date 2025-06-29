@@ -37,14 +37,13 @@ https://github.com/naddor/camels/blob/master/hydro/hydro_signatures.R
 """
 import warnings
 from collections import Counter
-
 import pandas as pd
 import numpy as np
 
-from configs.data_config.extract_config import ExtractConfig
 
-hfd_thresholds = ExtractConfig.hfd_thresholds
-stream_elas_thresholds = ExtractConfig.stream_elas_thresholds
+baseflow_thresholds = 60
+hfd_thresholds = [360, 300, 200]
+stream_elas_thresholds = [300, 200, 150]
 
 
 def calculate_q_mean(streamflow, quality):

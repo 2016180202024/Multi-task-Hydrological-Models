@@ -7,7 +7,7 @@ from utils.model.tools import count_parameters
 
 
 def test_full(test_model, decode_mode, loader_test, device, saving_root,
-              streamflow_size, signatures_size, use_baseflow, use_signatures):
+              streamflow_size, signatures_size, streamflow_columns, signatures_columns):
     t1 = time.time()
     print(f"Parameters count:{count_parameters(test_model)}")
     log_file = saving_root / f"log_test.csv"
@@ -29,36 +29,35 @@ def test_full(test_model, decode_mode, loader_test, device, saving_root,
     pred_streamflow[pred_streamflow < 0] = 0
     # streamflow eval columns
     eval_class = ['mean', 'median']
-    eval_stream_index = ['rmse', 'nse', 'kge', 'bias', 'tpe5', 'R']
-    streamflow_index = ['streamflow']
-    if use_baseflow:
-        streamflow_index.extend(['baseflow_5', 'baseflow_60'])
-    eval_stream_index = concat_columns(eval_class, eval_stream_index, streamflow_index)
+    eval_stream_index = ['rmse', 'nse', 'kge', 'fhv', 'fms', 'flv', 'bias', 'tpe5', 'R']
+    eval_stream_index = concat_columns(eval_class, eval_stream_index, streamflow_columns)
     # streamflow eval value
     cal_stream = CalcEvalIndex(obs=obs_streamflow, sim=pred_streamflow)
     rmse_mean, rmse_median = cal_stream.calc_rmse()
     nse_mean, nse_median = cal_stream.calc_nse()
     kge_mean, kge_median = cal_stream.calc_kge()
+    fhv_mean = cal_stream.calc_fdc_fhv()
+    fms_mean = cal_stream.calc_fdc_fms()
+    flv_mean = cal_stream.calc_fdc_flv()
     bias_mean, bias_median = cal_stream.calc_bias()
     tpe5_mean, tpe5_median = cal_stream.calc_tpe(5)
     R_mean, R_median = cal_stream.calc_R()
     eval_stream_data = np.concatenate(
         (mean_array(rmse_mean), mean_array(nse_mean), mean_array(kge_mean),
+         mean_array(fhv_mean), mean_array(fms_mean), mean_array(flv_mean),
          mean_array(bias_mean), mean_array(tpe5_mean), mean_array(R_mean),
          mean_array(rmse_median), mean_array(nse_median), mean_array(kge_median),
+         mean_array(fhv_mean), mean_array(fms_mean), mean_array(flv_mean),
          mean_array(bias_median), mean_array(tpe5_median), mean_array(R_median)), axis=1)
     eval_data[eval_stream_index] = eval_stream_data
     # signatures eval
-    if use_signatures:
+    if len(signatures_columns) > 0:
         obs_signatures, pred_signatures = (
             obs[:, :, -signatures_size:], pred[:, :, -signatures_size:]
         )
         # streamflow eval columns
         eval_sign_index = ['rmse', 'kge', 'bias', 'R']
-        signatures_index = ['q_mean', 'runoff_ratio', 'stream_elas', 'fdc_slope', 'BFI_5',
-                            'BFI_60', 'hfd_mean', 'q_5', 'q_95', 'high_q_freq', 'high_q_dur',
-                            'low_q_freq', 'low_q_dur', 'zero_q_freq']
-        eval_sign_index = concat_columns(eval_class, eval_sign_index, signatures_index)
+        eval_sign_index = concat_columns(eval_class, eval_sign_index, signatures_columns)
         # streamflow eval value
         cal_sign = CalcEvalIndex(obs=obs_signatures, sim=pred_signatures)
         nmse_mean, nmse_median = cal_sign.calc_nrmse()

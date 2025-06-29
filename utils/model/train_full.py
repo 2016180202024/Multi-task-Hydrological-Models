@@ -48,6 +48,8 @@ def train_full(model, decode_mode, train_loader, val_loader,
                 eval_model(model, train_loader, decode_mode, device, streamflow_size, signatures_size))
         val_sf_nse, val_bf_nse, val_sg_mse = (
             eval_model(model, val_loader, decode_mode, device, streamflow_size, signatures_size))
+        for v_i in range(2-len(val_bf_nse)):
+            val_bf_nse.append(0)
         if writer is not None:
             writer.write_board(f"train_loss", metric_value=np.sum(train_loss), epoch=i)
             writer.write_board(f"val_sf_nse", metric_value=val_sf_nse, epoch=i)
@@ -130,18 +132,22 @@ def train_epoch(model, data_loader, optimizer, scheduler,
         # calculate loss
         # need y_stds of each basin to calculate NSELoss
         y_stds = y_stds.to(device)
-        if streamflow_size == 1:
-            # 只有streamflow
+        # 仅有streamflow
+        if streamflow_size == 1 and signatures_size == 0:
             loss = loss_func(y_hat, y_seq_future, y_stds)
-        elif signatures_size == 0:
-            # 有streamflow和baseflow
+        # 有streamflow和baseflow
+        elif streamflow_size > 1 and signatures_size == 0:
             loss = loss_func(y_hat[:, :, :1], y_seq_future[:, :, :1], y_stds[:, :1],
                              y_hat[:, :, 1:], y_seq_future[:, :, 1:], y_stds[:, 1:])
-        else:
-            # 有streamflow、baseflow和signatures
+        # 有streamflow和signatures
+        elif streamflow_size == 1 and signatures_size > 0:
             loss = loss_func(y_hat[:, :, :1], y_seq_future[:, :, :1], y_stds[:, :1],
-                             y_hat[:, :, 1:streamflow_size], y_seq_future[:, :, 1:streamflow_size],
-                             y_stds[:, 1:streamflow_size],
+                             None, None, None,
+                             y_hat[:, :, -signatures_size:], y_seq_future[:, :, -signatures_size:])
+        # 有streamflow、baseflow和signatures
+        else:
+            loss = loss_func(y_hat[:, :, :1], y_seq_future[:, :, :1], y_stds[:, :1],
+                             y_hat[:, :, 1:streamflow_size], y_seq_future[:, :, 1:streamflow_size], y_stds[:, 1:streamflow_size],
                              y_hat[:, :, -signatures_size:], y_seq_future[:, :, -signatures_size:])
         # get all loss
         weights = loss_func.get_weights()

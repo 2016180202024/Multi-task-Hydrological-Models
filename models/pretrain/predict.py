@@ -4,23 +4,17 @@ import numpy as np
 import pandas as pd
 import torch
 import datetime as dt
-
-from pandas import compat
-
+from configs.data_config.dataset_config import DataShapeConfig
 from configs.data_config.path_config import PathConfig
 from configs.data_config.project_config import ProjectConfig
 from utils.model.buid_model import build_model_with_name_datashape, normalization, read_data_shape_by_model_name
 from utils.process_data.date_transform import date_to_doy
-from configs.data_config.extract_config import ExtractConfig
-
-streamflow_columns = ExtractConfig.streamflow_columns
-forcing_columns = ExtractConfig.forcing_columns
-device = ProjectConfig.device
 
 
 def predict_by_xy_seq_data(model, model_name, train_mean, train_stds,
                            x_seq, y_seq, past_len, pred_len, src_size, pred_size):
     # normalization x_seq & y_seq
+    device = ProjectConfig.device
     model = model.to(device)
     model.eval()
     with torch.no_grad():
@@ -37,23 +31,17 @@ def predict_by_xy_seq_data(model, model_name, train_mean, train_stds,
                 y_hat = model(x_seq, y_seq)[:, -pred_len:, :]
     y_hat = y_hat.cpu().numpy()
     y_hat = y_hat * y_std + y_mean
-    y_sign = None
-    if pred_size > 3:
-        y_sign = y_hat[:, :, 3:]
-        y_hat = y_hat[:, :, :3]
-    return y_hat, y_sign
+    return y_hat
 
 
 def get_xy_by_data(static_data, modis_data, sign_data, ts_data,
-                   past_len, pred_len, src_size, pred_size):
+                   past_len, pred_len, src_size, pred_size,
+                   streamflow_columns, forcing_columns):
     all_len = past_len + pred_len
     x_seq = np.empty(shape=(all_len, src_size), dtype=np.float32)
     y_seq = np.empty(shape=(all_len, pred_size), dtype=np.float32)
-    if pred_size <= 3:
-        y_seq = np.array(ts_data.loc[:, streamflow_columns[:pred_size]])
-    else:
-        y_seq[:, :3] = np.array(ts_data.loc[:, streamflow_columns[:pred_size]])
-        y_seq[:, 3:] = np.repeat(sign_data.reshape(1, -1), all_len, axis=0)
+    y_seq[:, :len(streamflow_columns)] = np.array(ts_data.loc[:, streamflow_columns])
+    y_seq[:, len(streamflow_columns):] = np.repeat(sign_data.reshape(1, -1), all_len, axis=0)
     first_index = ts_data.index[0]
     for days in range(all_len):
         date = ts_data.loc[days + first_index, 'date'].date()
@@ -85,17 +73,18 @@ def predict(camels_dict, model_path,
     print(f'[{dir_name}] is predicting!')
     output_dir_path = Path(dir_path) / 'predict'
     # 加载模型的输入数据类型
+    features_name = dir_name.split('@')[1].split(']')[-1][1:]
+    if 'True' in features_name or 'False' in features_name:
+        return
     data_shape = read_data_shape_by_model_name(dir_name)
     past_len, pred_len = data_shape['past_len'], data_shape['pred_len']
     all_len = past_len + pred_len
     src_size, pred_size = data_shape['src_size'], data_shape['pred_size']
-    pred_size_ts = 1 if pred_size == 1 else 3
-    output_columns = streamflow_columns[:1] if pred_size == 1 else streamflow_columns
     # 加载模型
     model_name = str.split(dir_name, '_')[0]
     datashape = {'src_len': all_len, 'src_size': src_size, 'past_len': past_len,
                  'pred_len': pred_len, 'tgt_size': pred_size}
-    model = build_model_with_name_datashape(model_name, datashape)
+    model = build_model_with_name_datashape(model_name, datashape, features_name)
     state_dict = {}
     for k, v in torch.load(model_path).items():
         state_dict[k[7:]] = v
@@ -109,6 +98,9 @@ def predict(camels_dict, model_path,
         all_length += len(camels_dict[camels])
     temp_length = 0
     zero_len_gauge_list = []
+    # 读取feature输入
+    data_config = DataShapeConfig(past_len, pred_len, features_name)
+    streamflow_columns, signatures_column, forcing_columns = data_config.streamflow_columns, data_config.signatures_columns, data_config.forcing_columns
     # 输入：camels_static.csv (static & modis & signatures)
     for camels in camels_dict:
         camels_output_dir_path = output_dir_path / camels
@@ -144,7 +136,7 @@ def predict(camels_dict, model_path,
             ts_data = ts_data.rename(columns={'key_0': 'date'})
             static_gauge_data = np.array(static_data.loc[gauge_id, :])
             modis_gauge_data = modis_data.loc[gauge_id, :].to_dict()
-            sign_gauge_data = np.array(sign_data.loc[gauge_id, :])
+            sign_gauge_data = np.array(sign_data.loc[gauge_id, signatures_column])
             start = 0
             end = past_len
             length = ts_data.shape[0]
@@ -153,7 +145,7 @@ def predict(camels_dict, model_path,
             y_seq_all = []
             while end <= length - pred_len:
                 # 1. 处理nan值，获取数据的开始结束的index
-                streamflow = ts_data.loc[start:end, output_columns]  # 在选定时间范围中的时间序列数据，如60天
+                streamflow = ts_data.loc[start:end, streamflow_columns]  # 在选定时间范围中的时间序列数据，如60天
                 # 如果在past_len中有nan值，那么预测第一个nan值及其后面的,并且start变为第一个notnan或end
                 if np.isnan(np.array(streamflow)).any():
                     nan_index = streamflow.index[np.where(np.isnan(streamflow))[0]]
@@ -176,7 +168,7 @@ def predict(camels_dict, model_path,
                 temp_ts_data = ts_data.iloc[pred_start:pred_end, :]
                 x_seq, y_seq = get_xy_by_data(
                     static_gauge_data, modis_gauge_data, sign_gauge_data, temp_ts_data,
-                    past_len, pred_len, src_size, pred_size)
+                    past_len, pred_len, src_size, pred_size, streamflow_columns, forcing_columns)
                 if np.isnan(x_seq).any() or np.isnan(y_seq[:past_len, :]).any():
                     continue
                 index_arr.append(pred_end)
@@ -186,7 +178,7 @@ def predict(camels_dict, model_path,
             temp_ts_data = ts_data.iloc[length - all_len:length, :]
             x_seq, y_seq = get_xy_by_data(
                 static_gauge_data, modis_gauge_data, sign_gauge_data, temp_ts_data,
-                past_len, pred_len, src_size, pred_size)
+                past_len, pred_len, src_size, pred_size, streamflow_columns, forcing_columns)
             if not (np.isnan(x_seq).any() or np.isnan(y_seq[:past_len, :]).any()):
                 index_arr.append(length)
                 x_seq_all.append(x_seq)
@@ -195,20 +187,21 @@ def predict(camels_dict, model_path,
             if len(x_seq_all) <= 1:
                 zero_len_gauge_list.append(gauge_id)
                 continue
-            y_hat, _ = predict_by_xy_seq_data(model, model_name, train_mean, train_std,
-                                              np.array(x_seq_all), np.array(y_seq_all),
-                                              past_len, pred_len, src_size, pred_size)
+            y_hat = predict_by_xy_seq_data(model, model_name, train_mean, train_std,
+                                           np.array(x_seq_all), np.array(y_seq_all),
+                                           past_len, pred_len, src_size, pred_size)
+            y_hat = y_hat[:, :, :len(streamflow_columns)]
             # 4. 将y_hat, y_sign根据index_array拼接到输出中
-            y_ts_pred = np.full(shape=(length, pred_size_ts), fill_value=np.nan)
+            y_ts_pred = np.full(shape=(length, len(streamflow_columns)), fill_value=np.nan)
             for index in range(len(index_arr)):
                 end = index_arr[index]
                 start = end - pred_len
                 y_ts_pred[start:end, :] = y_hat[index, :, :]
             y_ts_pred[y_ts_pred < 0] = 0
             # 5. 输出文件
-            pred_output_columns = [x + '_pred' for x in output_columns]
-            output_columns1 = ['date'] + output_columns
-            ts_data = ts_data.loc[:, output_columns1]
+            pred_output_columns = [x + '_pred' for x in streamflow_columns]
+            output_columns = np.insert(streamflow_columns, 0, 'date')
+            ts_data = ts_data.loc[:, output_columns]
             ts_data.loc[:, pred_output_columns] = y_ts_pred
             ts_data.to_csv(str(output_file_path), index=False)
     print(zero_len_gauge_list)
@@ -246,9 +239,10 @@ def camels_predict():
     camels_dict = load_used_basin_dict()
     dir_path = Path(PathConfig.model_path)
     # '30', '60', '90', '120'
-    for days in ['30']:
+    for days in ['90']:
         days_dir_path = dir_path / days
-        for model in ['LSTMMSVS2S', 'Transformer']:
+        # 'LSTMMSVS2S', 'Transformer'
+        for model in ['Transformer']:
             for model_dir_path in days_dir_path.glob(f'{model}_*'):
                 model_path = list(model_dir_path.glob(f"(max_sf_nse)*.pkl"))
                 assert (len(model_path) == 1)

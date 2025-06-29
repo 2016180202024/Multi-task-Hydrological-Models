@@ -1,8 +1,11 @@
 import importlib
 import os
-
 import numpy as np
 import torch
+from torch import nn
+
+from configs.data_config.dataset_config import DataShapeConfig
+from configs.data_config.project_config import ProjectConfig
 
 
 def read_data_shape_by_model_name(dir_name):
@@ -29,13 +32,12 @@ def build_model_with_name(used_model):
     return model
 
 
-def build_model_with_name_datashape(used_model, datashape):
+def build_model_with_name_datashape(used_model, datashape, features_name):
     # 先修改model_config
     model_congfigs = importlib.import_module(f"configs.model_config.{used_model}_config")
     ModelConfig = getattr(model_congfigs, f"{used_model}Config")
-    model_config = ModelConfig(datashape['src_len'], datashape['src_size'],
-                               datashape['past_len'], datashape['pred_len'],
-                               datashape['tgt_size'])
+    data_config = DataShapeConfig(datashape['past_len'], datashape['pred_len'], features_name)
+    model_config = ModelConfig(data_config)
     # 后新建model
     model = build_model_with_name_config(used_model, model_config)
     return model
@@ -63,7 +65,9 @@ def load_model_by_path(model_path):
     datashape = {'src_len': all_len, 'src_size': src_size, 'past_len': past_len,
                  'pred_len': pred_len, 'tgt_size': pred_size}
     model = build_model_with_name_datashape(model_name, datashape)
-    model.load_state_dict(torch.load(model_path))
+    model.state_dict = torch.load(model_path)
+    if ProjectConfig.multi_gpu:
+        model = nn.DataParallel(model)
     return model, datashape
 
 

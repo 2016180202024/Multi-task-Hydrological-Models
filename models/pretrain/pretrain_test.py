@@ -16,35 +16,40 @@ from utils.model.tools import seed_torch
 warnings.filterwarnings("ignore")
 
 
-if __name__ == '__main__':
+def pretrain_test(past_len, pred_len, feature_name, model_name):
     device = ProjectConfig.device
     num_workers = ProjectConfig.num_workers
     dataset_num_worker = ProjectConfig.dataset_num_worker
-    use_board = ProjectConfig.use_board
     prefetch_factor = ProjectConfig.prefetch_factor
 
-    seed = PretrainConfig.seed
-    data_root = PretrainConfig.data_root
-    saving_root = Path(PretrainConfig.saving_root)
-    basin_root = PretrainConfig.basin_root
-    used_model = PretrainConfig.used_model
-    decode_mode = PretrainConfig.decode_mode
-    n_epochs = PretrainConfig.n_epochs
-    batch_size = PretrainConfig.batch_size
-    learning_rate = PretrainConfig.learning_rate
-    scheduler_paras = PretrainConfig.scheduler_paras
-    best_model = PretrainConfig.model
+    datashape_config = DataShapeConfig(past_len, pred_len, feature_name)
+    past_len = datashape_config.past_len
+    pred_len = datashape_config.pred_len
+    src_size = datashape_config.src_size
+    use_baseflow = datashape_config.use_baseflow
+    use_signatures = datashape_config.use_signatures
+    out_features_index = datashape_config.out_features_index
+    streamflow_size = datashape_config.streamflow_size
+    signatures_size = datashape_config.signatures_size
+    streamflow_index = out_features_index[0]
+    signatures_index = out_features_index[1]
+    streamflow_columns = datashape_config.streamflow_columns
+    signatures_columns = datashape_config.signatures_columns
 
-    past_len = DataShapeConfig.past_len
-    pred_len = DataShapeConfig.pred_len
-    use_baseflow = DataShapeConfig.use_baseflow
-    use_signatures = DataShapeConfig.use_signatures
-    streamflow_size = DataShapeConfig.streamflow_size
-    signatures_size = DataShapeConfig.signatures_size
-    src_size = DataShapeConfig.src_size
+    pretrain_config = PretrainConfig('test', model_name, datashape_config)
+    seed = pretrain_config.seed
+    data_root = pretrain_config.data_root
+    saving_root = Path(pretrain_config.saving_root)
+    basin_root = pretrain_config.basin_root
+    decode_mode = pretrain_config.decode_mode
+    batch_size = pretrain_config.batch_size
+    best_model = pretrain_config.model
 
     print("pid:", os.getpid())
     seed_torch(seed=seed)
+    if (saving_root / 'log_test.csv').exists():
+        print(f'Already test in {saving_root}!')
+        return
     print(saving_root)
     # Model
     best_path = list(saving_root.glob(f"(max_sf_nse)*.pkl"))
@@ -60,12 +65,25 @@ if __name__ == '__main__':
     train_y_std = train_stds[src_size:]
 
     # Dataset
-    basin_test = pd.read_excel(basin_root, sheet_name='test').iloc[:, 0].tolist()
-    dataset_test = CamelsDataset(data_root, basin_test, past_len, pred_len, use_baseflow, use_signatures,
+    with open(basin_root, 'rb') as f:
+        basin_test = list(pickle.load(f))
+
+    dataset_test = CamelsDataset(data_root, basin_test, past_len, pred_len,
+                                 use_baseflow, use_signatures, streamflow_index, signatures_index,
                                  device, dataset_num_worker, 'test',
                                  x_mean=train_x_mean, y_mean=train_y_mean, x_std=train_x_std, y_std=train_y_std)
     loader_test = DataLoader(dataset_test, batch_size=batch_size, num_workers=num_workers,
                              prefetch_factor=prefetch_factor, shuffle=False)
     # Testing
     test_full(best_model, decode_mode, loader_test, device, saving_root,
-              streamflow_size, signatures_size, use_baseflow, use_signatures)
+              streamflow_size, signatures_size, streamflow_columns, signatures_columns)
+
+
+if __name__ == '__main__':
+    feature_list = ['streamflow', 'baseflow', 'baseflow_signatures']
+    for past_len in [90]:
+        for feature in feature_list:
+            pred_len = 30
+            if past_len == 15:
+                pred_len = 15
+            pretrain_test(past_len, pred_len, feature, 'LSTMMSVS2S')

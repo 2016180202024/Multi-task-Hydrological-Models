@@ -14,10 +14,10 @@ class StreamflowLoss(torch.nn.Module):
         The weight of MSE loss of static signatures to NSE Loss of timeseries streamflow.
     """
 
-    def __init__(self, model: torch.nn.Module = None, weights: torch.tensor = None,
-                 eps: float = 0.1, device='cuda'):
+    def __init__(self, model: torch.nn.Module = None,
+                 weights: torch.tensor = None,
+                 device='cuda'):
         super().__init__()
-        self.eps = torch.tensor(eps, dtype=torch.float32)
         self.device = device
         self.gradnorm = None
         self.weights = torch.tensor([1], dtype=torch.float32, device=device)
@@ -64,27 +64,26 @@ class StreamflowLoss(torch.nn.Module):
         loss = [sf_loss]
         if bf_pred is not None:
             bf_loss = self.calc_nse(bf_pred, bf_true, bf_stds)
-            loss.append(0.005 * bf_loss)
+            loss.append(0.1 * bf_loss)
         if sg_pred is not None:
-            sg_loss = self.calc_mse(sg_pred, sg_true)
+            sg_loss = self.calc_rmse(sg_pred, sg_true)
             loss.append(0.1 * sg_loss)
         loss = torch.stack(loss)
         return loss
 
-    def calc_nse(self, pred, true, stds):
+    def calc_nse(self, pred, true, stds, eps: float = 0.1):
         nse_error = (pred - true) ** 2
-        self.eps = self.eps.to(stds.device)
-        nse_weights = 1 / (stds + self.eps) ** 2
+        nse_weights = 1 / (stds + eps) ** 2
         nse_weights = nse_weights.reshape(nse_weights.shape[0], 1, nse_weights.shape[1])
         nse_weights = nse_weights.repeat(1, pred.shape[1], 1)
         streamflow_loss = torch.nanmean(nse_weights * nse_error)
         return streamflow_loss
 
-    def calc_mse(self, pred, true):
+    def calc_rmse(self, pred, true):
         pred = pred.nanmean(dim=1, keepdim=False)
         true = true.nanmean(dim=1, keepdim=False)
-        mse_error = torch.nanmean((pred - true) ** 2)
-        return mse_error
+        rmse_error = torch.sqrt(torch.nanmean((pred - true) ** 2))
+        return rmse_error
 
     def get_weights_numpy(self):
         return self.weights.clone().detach().cpu().numpy()

@@ -13,14 +13,12 @@ class LSTMConfig:
     hidden_size_d = 128
     dropout_rate = 0.2
 
-    def __init__(self, src_len=DataShapeConfig.src_len, src_size=DataShapeConfig.src_size,
-                 past_len=DataShapeConfig.past_len, pred_len=DataShapeConfig.pred_len,
-                 tgt_size=DataShapeConfig.tgt_size):
-        self.seq_len_e = src_len
-        self.output_len_e = pred_len
-        self.input_size_e = src_size
-        self.output_len_d = pred_len
-        self.output_size = tgt_size
+    def __init__(self, datashape_config: DataShapeConfig):
+        self.seq_len_e = datashape_config.src_len
+        self.output_len_e = datashape_config.pred_len
+        self.input_size_e = datashape_config.src_size
+        self.output_len_d = datashape_config.pred_len
+        self.output_size = datashape_config.tgt_size
 
     model_info = (f"{model_name}_"
                   f"[hs1_{hidden_size_e},hs3_{hidden_size_d},dr_{dropout_rate}]")

@@ -1,0 +1,340 @@
+import os.path
+import pickle
+import warnings
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import torch
+import datetime as dt
+import shap
+from torch import nn
+from configs.data_config.dataset_config import DataShapeConfig
+from configs.data_config.path_config import PathConfig
+from configs.data_config.predict_config import PredictConfig
+from configs.data_config.project_config import ProjectConfig
+from models.shap.feature_selector import FeatureSelector
+from models.shap.shap_wrapper import ShapWrapper
+from utils.model.buid_model import build_model_with_name_datashape, normalization, read_data_shape_by_model_name
+from utils.process_data.date_transform import date_to_doy
+
+
+warnings.filterwarnings('ignore')
+
+
+def shap_by_xy_seq_data(model, model_name,
+                        x_seq_time, x_seq_static, y_seq_time, y_seq_static):
+    days = x_seq_time.shape[1]
+    past_len, pred_len = y_seq_time.shape[1], days-y_seq_time.shape[1]
+    x_time_len, x_static_len = x_seq_time.shape[2], x_seq_static.shape[1]
+    y_time_len, y_static_len = y_seq_time.shape[2], y_seq_static.shape[1]
+    samples_num = x_seq_time.shape[0]
+    x_seq = torch.cat([x_seq_time.reshape(samples_num, -1), x_seq_static.reshape(samples_num, -1)], dim=1)
+    y_seq = torch.cat([y_seq_time.reshape(samples_num, -1), y_seq_static.reshape(samples_num, -1)], dim=1)
+    all_seq = torch.cat([x_seq, y_seq], dim=1)
+    # background_data
+    shap_background_size = PredictConfig.shap_background_size
+    background_choice = np.random.choice(samples_num, shap_background_size, replace=False)
+    background_data = all_seq[background_choice]
+    sample_choice = [i for i in range(samples_num) if i not in background_choice]
+    sample_size = PredictConfig.shap_sample_size
+    if len(sample_choice) > sample_size:
+        sample_choice = np.random.choice(sample_choice, sample_size, replace=False)
+    # feature selector
+    mask_feature_index = []
+    if y_static_len > 0:
+        x_y_len = days * x_time_len + x_static_len + past_len * y_time_len
+        for feature_index in range(y_static_len):
+            mask_feature_index.append(x_y_len + feature_index)
+    feature_mask = np.full(fill_value=True, shape=(all_seq.shape[1]))
+    feature_mask[mask_feature_index] = False
+    baseline_data = background_data.mean(dim=0)
+    feature_selector = FeatureSelector(baseline_data, feature_mask)
+    # wrapper model
+    wrapper_model = ShapWrapper(
+        model, model_name, past_len, pred_len, feature_selector,
+        x_time_len, x_static_len, y_time_len, y_static_len
+    ).to(device=x_seq.device)
+    # explainer
+    explainer = shap.DeepExplainer(
+        model=wrapper_model,
+        data=background_data
+    )
+    # output shap values
+    model.train()
+    wrapper_model.train()
+    shap_values = explainer.shap_values(
+        all_seq[sample_choice],
+        check_additivity=False
+    )
+    # [forcing * days, static, flow * past_days, signatures]
+    return shap_values.mean(axis=0)
+
+
+def predict_by_xy_seq_data(model, model_name, x_seq, y_seq,
+                           past_len, pred_len, src_size, pred_size):
+    with torch.no_grad():
+        model.eval()
+        y_hat = model(x_seq, y_seq)
+        if 'LSTM' not in model_name:
+            y_hat = y_hat[:, -pred_len:, :]
+        y_hat = y_hat.cpu().numpy()
+        return y_hat
+
+
+# x_seq.shape = (days, 53[doy, lai, lai_maxdiff, evi, evi_maxdiff, forcing_columns==11, static_columns==37])
+# y_seq.shape = (days, 17[streamflow_columns==3, signatures_columns==14])
+def get_xy_by_data(static_data, modis_data, sign_data, ts_data,
+                   past_len, pred_len, src_size, pred_size,
+                   streamflow_columns, forcing_columns):
+    all_len = past_len + pred_len
+    x_seq = np.empty(shape=(all_len, src_size), dtype=np.float32)
+    y_seq = np.empty(shape=(all_len, pred_size), dtype=np.float32)
+    y_seq[:, :len(streamflow_columns)] = np.array(ts_data.loc[:, streamflow_columns])
+    y_seq[:, len(streamflow_columns):] = np.repeat(sign_data.reshape(1, -1), all_len, axis=0)
+    first_index = ts_data.index[0]
+    for days in range(all_len):
+        date = ts_data.loc[days + first_index, 'date'].date()
+        doy = int(date_to_doy(date))
+        if date >= dt.date(2000, 1, 1):
+            date_str = str(date.year) + '%02d' % date.month
+            lai = modis_data['lai_' + date_str]
+            lai_maxdiff = modis_data['lai_' + str(date.year) + '_maxdiff']
+            evi = modis_data['evi_' + date_str]
+            evi_maxdiff = modis_data['evi_' + str(date.year) + '_maxdiff']
+        else:
+            month = '%02d' % date.month
+            lai = modis_data['lai_' + month]
+            lai_maxdiff = modis_data['lai_maxdiff']
+            evi = modis_data['evi_' + month]
+            evi_maxdiff = modis_data['evi_maxdiff']
+        x_seq[days, :5] = [doy, lai, lai_maxdiff, evi, evi_maxdiff]
+    x_seq[:, 5:5 + len(forcing_columns)] = np.array(ts_data.loc[:, forcing_columns])
+    x_seq[:, 5 + len(forcing_columns):] = np.repeat(static_data.reshape(1, -1), all_len, axis=0)
+    return x_seq, y_seq
+
+
+def predict(gauge_id_list, model_path,
+            input_path=PathConfig.origin_path, need_shape=False):
+    input_path = Path(input_path)
+    dir_path = os.path.dirname(model_path)
+    dir_name = os.path.basename(dir_path)
+    print('--------------------------------------')
+    print(f'[{dir_name}] is predicting!')
+    output_dir_path = Path(dir_path) / 'predict'
+    output_dir_path.mkdir(exist_ok=True, parents=True)
+    device = ProjectConfig.device
+    # 加载模型的输入数据类型
+    features_name = dir_name.split('@')[1].split(']')[-1][1:]
+    if 'True' in features_name or 'False' in features_name:
+        return
+    data_shape = read_data_shape_by_model_name(dir_name)
+    past_len, pred_len = data_shape['past_len'], data_shape['pred_len']
+    all_len = past_len + pred_len
+    src_size, pred_size = data_shape['src_size'], data_shape['pred_size']
+    # 加载模型
+    model_name = str.split(dir_name, '_')[0]
+    datashape = {'src_len': all_len, 'src_size': src_size, 'past_len': past_len,
+                 'pred_len': pred_len, 'tgt_size': pred_size}
+    model = build_model_with_name_datashape(model_name, datashape, features_name)
+    state_dict = {}
+    for k, v in torch.load(model_path).items():
+        state_dict[k[7:]] = v
+    model.load_state_dict(state_dict)
+    if torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)  # 默认使用所有可见 GPU
+    model = model.cuda()  # 将模型移动到 GPU
+    # 加载训练数据的x_mean x_std
+    train_mean = np.loadtxt(os.path.join(dir_path, 'train_means.csv'), dtype="float32")
+    train_std = np.loadtxt(os.path.join(dir_path, 'train_stds.csv'), dtype="float32")
+    # 计算全部len
+    all_length = len(gauge_id_list)
+    temp_length = 0
+    # 读取feature输入
+    data_config = DataShapeConfig(past_len, pred_len, features_name)
+    streamflow_columns, signatures_column, forcing_columns = data_config.streamflow_columns, data_config.signatures_columns, data_config.forcing_columns
+    # 输入：camels_static.csv (static & modis & signatures)
+    camels_list = PredictConfig.camels_list
+    all_static_data = {
+        camels: {
+            'static_data': pd.read_csv(
+                input_path / camels / 'static' / (camels + '_static_features.csv')
+            ).set_index('gauge_id'),
+            'modis_data': pd.read_csv(
+                input_path / camels / 'static' / (camels + '_modis_features.csv')
+            ).set_index('gauge_id'),
+            'sign_data': pd.read_csv(
+                input_path / camels / 'static' / (camels + '_streamflow_signatures.csv')
+            ).set_index('gauge_id')
+        } for camels in camels_list
+    }
+    # shap dict
+    output_shap_path = output_dir_path / 'shap.plk'
+    if output_shap_path.exists():
+        with open(output_shap_path, "rb") as tf:
+            shap_dict = pickle.load(tf)
+    else:
+        shap_dict = {}
+    # read for every dict
+    for gauge_id in gauge_id_list:
+        camels = gauge_id.split('_')[0]
+        camels_output_dir_path = output_dir_path / camels
+        camels_output_dir_path.mkdir(parents=True, exist_ok=True)
+        static_data = all_static_data[camels]['static_data']
+        modis_data = all_static_data[camels]['modis_data']
+        sign_data = all_static_data[camels]['sign_data']
+        # 输入：gauge_id.csv (timeseries)
+        temp_length += 1
+        output_csv_path = camels_output_dir_path / (gauge_id + '_pred.csv')
+        if output_csv_path.exists():
+            print(f'[{temp_length}/{all_length}] [{gauge_id}] is exists!')
+            continue
+        # read gauge_id.csv timeseries data
+        ts_path = input_path / camels / 'timeseries' / (gauge_id + '.csv')
+        ts_data = pd.read_csv(str(ts_path), index_col='date')
+        if '-' in str(ts_data.index[0]):
+            ts_data.index = pd.to_datetime(ts_data.index, format='%Y-%m-%d')
+        else:
+            ts_data.index = pd.to_datetime(ts_data.index, format='%Y/%m/%d')
+        start_date = ts_data.index[0]
+        end_date = ts_data.index[-1]
+        print(f'[{temp_length}/{all_length}] [{gauge_id}]: ({start_date},{end_date}）')
+        # prepare output data
+        df_date = pd.DataFrame(index=pd.date_range(start=start_date, end=end_date, freq='D'))
+        ts_data = pd.merge(df_date, ts_data, how='left',
+                           left_on=df_date.index, right_on=ts_data.index)
+        ts_data = ts_data.rename(columns={'key_0': 'date'})
+        static_gauge_data = np.array(static_data.loc[gauge_id, :])
+        modis_gauge_data = modis_data.loc[gauge_id, :].to_dict()
+        sign_gauge_data = np.array(sign_data.loc[gauge_id, signatures_column])
+        start = 0
+        end = past_len
+        length = ts_data.shape[0]
+        index_arr = []
+        x_seq_all = []
+        y_seq_all = []
+        while end <= length - pred_len:
+            # 1. 处理nan值，获取数据的开始结束的index
+            streamflow = ts_data.loc[start:end, streamflow_columns]  # 在选定时间范围中的时间序列数据，如60天
+            # 如果在past_len中有nan值，那么预测第一个nan值及其后面的,并且start变为第一个notnan或end
+            if np.isnan(np.array(streamflow)).any():
+                nan_index = streamflow.index[np.where(np.isnan(streamflow))[0]]
+                first_nan_index = nan_index.values[0]
+                last_nan_index = nan_index.values[-1]
+                # 输入序列为[nanindex-pastlen, nanindex+pred_len]
+                pred_start = first_nan_index - past_len
+                pred_end = first_nan_index + pred_len
+                start = last_nan_index + 1
+                end = start + past_len
+                if pred_start <= 0:
+                    continue
+            # 如果没有nan值,正常预测
+            else:
+                pred_start = start
+                pred_end = end + pred_len
+                start = start + pred_len
+                end = end + pred_len
+            # 2. 根据数据获取x_seq和y_seq，并拼接到输入数据中
+            temp_ts_data = ts_data.iloc[pred_start:pred_end, :]
+            x_seq, y_seq = get_xy_by_data(
+                static_gauge_data, modis_gauge_data, sign_gauge_data, temp_ts_data,
+                past_len, pred_len, src_size, pred_size, streamflow_columns, forcing_columns)
+            if np.isnan(x_seq).any() or np.isnan(y_seq[:past_len, :]).any():
+                continue
+            index_arr.append(pred_end)
+            x_seq_all.append(x_seq)
+            y_seq_all.append(y_seq)
+        # 最后处理一次，以防有遗留
+        temp_ts_data = ts_data.iloc[length - all_len:length, :]
+        x_seq, y_seq = get_xy_by_data(
+            static_gauge_data, modis_gauge_data, sign_gauge_data, temp_ts_data,
+            past_len, pred_len, src_size, pred_size, streamflow_columns, forcing_columns)
+        if not (np.isnan(x_seq).any() or np.isnan(y_seq[:past_len, :]).any()):
+            index_arr.append(length)
+            x_seq_all.append(x_seq)
+            y_seq_all.append(y_seq)
+        # 3. 将x_seq和y_seq输入模型，并得到输出y_hat, y_sign
+        if len(x_seq_all) <= 1:
+            continue
+        # normalization x_seq & y_seq
+        x_mean, y_mean = train_mean[:src_size], train_mean[src_size:]
+        x_std, y_std = train_std[:src_size], train_std[src_size:]
+        x_seq_all = torch.tensor(normalization(np.array(x_seq_all), x_mean, x_std), dtype=torch.float32).to(device)
+        y_seq_all = torch.tensor(normalization(np.array(y_seq_all), y_mean, y_std), dtype=torch.float32).to(device)
+        if 'LSTM' in model_name:
+            y_seq_all = y_seq_all[:, :past_len, :]
+        # calculate shap values
+        # time0 = int(time.time())
+        if need_shape and gauge_id not in shap_dict.keys():
+            all_days = x_seq_all.shape[1]
+            x_time_len, x_static_len = 5 + len(forcing_columns), static_data.shape[1]
+            y_time_len, y_static_len = len(streamflow_columns), len(signatures_column)
+            x_seq_time, x_seq_static = x_seq_all[:, :, :x_time_len], x_seq_all[:, 0, x_time_len:]
+            y_seq_time, y_seq_static = y_seq_all[:, :, :y_time_len], y_seq_all[:, 0, y_time_len:]
+            shap_values = shap_by_xy_seq_data(
+                model, model_name, x_seq_time, x_seq_static, y_seq_time, y_seq_static
+            )
+            # [days * forcing, static, past_days * flow]
+            shap_dict[gauge_id] = {
+                'forcing': shap_values[:x_time_len*all_days, :].reshape(all_days, x_time_len, shap_values.shape[1]),
+                'static': shap_values[x_time_len*all_days:x_time_len*all_days+x_static_len, :],
+                'runoff': shap_values[x_time_len*all_days+x_static_len:x_time_len*all_days+x_static_len+y_time_len*past_len, :].reshape(past_len, y_time_len, shap_values.shape[1]),
+            }
+            with open(output_shap_path, "wb") as tf:
+                pickle.dump(shap_dict, tf)
+        # time1 = int(time.time())
+        # print((time1-time0))
+        # calculate y_hat
+        y_hat = predict_by_xy_seq_data(
+            model, model_name, x_seq_all, y_seq_all,
+            past_len, pred_len, src_size, pred_size
+        )
+        y_hat = y_hat * y_std + y_mean
+        y_hat = y_hat[:, :, :len(streamflow_columns)]
+        # time0 = int(time.time())
+        # print((time0-time1))
+        # 4. 将y_hat, y_sign根据index_array拼接到输出中
+        y_ts_pred = np.full(shape=(length, len(streamflow_columns)), fill_value=np.nan)
+        for index in range(len(index_arr)):
+            end = index_arr[index]
+            start = end - pred_len
+            y_ts_pred[start:end, :] = y_hat[index, :, :]
+        y_ts_pred[y_ts_pred < 0] = 0
+        # 5. 输出文件
+        pred_output_columns = [x + '_pred' for x in streamflow_columns]
+        output_columns = np.insert(streamflow_columns, 0, 'date')
+        ts_data = ts_data.loc[:, output_columns]
+        ts_data.loc[:, pred_output_columns] = y_ts_pred
+        ts_data.to_csv(str(output_csv_path), index=False)
+
+
+def camels_predict():
+    used_basins = get_used_basins()
+    root_path = Path(PathConfig.model_path)
+    models = ['LSTMMSVS2S', 'Transformer']
+    days = [30]
+    # days = [60]
+    # days = [90]
+    # days = [120]
+    predict_days = [5, 10, 15, 20, 25, 30]
+    # days = range(60, 90, 5)
+    # days = range(90, 120, 5)
+    # days = range(120, 150, 5)
+    days = range(150, 170, 5)
+    for model in models:
+        for day in days:
+            for predict_day in predict_days:
+                day_dir_path = root_path / str(day)
+                # for dir_path in day_dir_path.glob(f'*@[{int(day) - 30}-30,*'):
+                for dir_path in day_dir_path.glob(f'{model}*@[{day-predict_day}-{predict_day},*'):
+                    need_shape = False
+                    if (day in [30, 60, 90, 120] and model == 'LSTMMSVS2S' and
+                            ('_streamflow' in str(dir_path) or '_baseflow_signatures' in str(dir_path))):
+                        need_shape = True
+                        continue
+                    model_path = list(dir_path.glob(f"(max_sf_nse)*.pkl"))
+                    assert (len(model_path) == 1)
+                    predict(used_basins, model_path[0], need_shape=need_shape)
+
+
+if __name__ == '__main__':
+    camels_predict()
