@@ -2,14 +2,12 @@ import os
 import pickle
 from pathlib import Path
 import numpy as np
-import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 from configs.data_config.dataset_config import DataShapeConfig
 from configs.data_config.project_config import ProjectConfig
 from configs.train_config.pretrain_config import PretrainConfig
 from data.train_data.dataset import CamelsDataset
-from models.pretrain.pretrain_test import pretrain_test
 from utils.model.tools import seed_torch
 from utils.model.train_full import train_full
 
